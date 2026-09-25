@@ -2,18 +2,16 @@ import { normalizeOptionalAgentRuntimeId } from "../agents/agent-runtime-id.js";
 import { getRuntimeConfig } from "../config/config.js";
 import { getRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
 import { cleanupPluginHostSessionStore } from "../config/sessions/session-accessor.js";
-import { resolveSqliteTargetFromSessionStorePath } from "../config/sessions/session-sqlite-target.js";
 import {
   resolveAllAgentSessionStoreTargetsSync,
-  resolveConfiguredAgentDatabaseTargets,
   type SessionStoreTarget,
 } from "../config/sessions/targets.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { normalizeAgentId } from "../routing/session-key.js";
 import { readAgentDatabaseAdmissionRefusal } from "../state/agent-database-admission.js";
-import { createRetainedAgentDatabaseMatcher } from "../state/agent-deletion-discovery.js";
-import { readAgentDeletionJournal } from "../state/agent-deletion-journal.js";
+import { listAgentDeletionJournals } from "../state/agent-deletion-journal.js";
 import { appendPluginInstanceCleanupFailures } from "./host-hook-cleanup-result.js";
 import { withPluginHostCleanupTimeout } from "./host-hook-cleanup-timeout.js";
 import type {
@@ -43,36 +41,6 @@ function shouldCleanPlugin(pluginId: string, filterPluginId?: string): boolean {
   return !filterPluginId || pluginId === filterPluginId;
 }
 
-// A retirement shares its resolved targets across plugins; report each skipped store once.
-const reportedDeletedAgentStores = new WeakSet<SessionStoreTarget>();
-
-/** Like startup, leave stores of finished and unfinished agent deletions to their fence. */
-function isDeletedAgentSessionStore(cfg: OpenClawConfig, target: SessionStoreTarget): boolean {
-  const env = process.env;
-  const deletion =
-    readAgentDeletionJournal(target.agentId, { env }, "runtime") ??
-    createRetainedAgentDatabaseMatcher(
-      env,
-      () => resolveConfiguredAgentDatabaseTargets(cfg, { env }),
-      "database",
-      "runtime",
-    )(
-      resolveSqliteTargetFromSessionStorePath(target.storePath, { agentId: target.agentId, env })
-        .path,
-      target.agentId,
-    );
-  if (typeof deletion !== "object") {
-    return false;
-  }
-  if (!reportedDeletedAgentStores.has(target)) {
-    reportedDeletedAgentStores.add(target);
-    log.info(
-      `Skipping plugin session cleanup for deleted agent ${deletion.agentId} store ${target.storePath}`,
-    );
-  }
-  return true;
-}
-
 async function clearPluginSessionStores(params: {
   cfg: OpenClawConfig;
   mode: "plugin-owned-state" | "promoted-slots";
@@ -99,10 +67,7 @@ async function clearPluginSessionStores(params: {
     if (params.shouldCleanup && !params.shouldCleanup()) {
       break;
     }
-    if (
-      readAgentDatabaseAdmissionRefusal(target.agentId) ||
-      isDeletedAgentSessionStore(params.cfg, target)
-    ) {
+    if (readAgentDatabaseAdmissionRefusal(target.agentId)) {
       continue;
     }
     cleared += await cleanupPluginHostSessionStore({
@@ -333,6 +298,23 @@ function collectRestartPromotedSessionEntrySlotKeys(
   return staleSlotKeys;
 }
 
+/** Like startup, leave stores of finished and unfinished agent deletions to their fence. */
+function resolveRetiringSessionStoreTargets(cfg: OpenClawConfig): SessionStoreTarget[] {
+  const targets = resolveAllAgentSessionStoreTargetsSync(cfg);
+  const deletedAgentIds = new Set(
+    listAgentDeletionJournals({}, "runtime").map((deletion) => deletion.agentId),
+  );
+  return targets.filter((target) => {
+    if (!deletedAgentIds.has(normalizeAgentId(target.agentId))) {
+      return true;
+    }
+    log.info(
+      `Skipping plugin session cleanup for deleted agent ${target.agentId} store ${target.storePath}`,
+    );
+    return false;
+  });
+}
+
 /** Prepares one retirement; each waiter keeps its caller's exact instance admission. */
 export function createPluginHostRegistryRetirement(params: {
   cfg?: OpenClawConfig;
@@ -361,8 +343,9 @@ export function createPluginHostRegistryRetirement(params: {
   ]);
   let sessionStoreTargets: readonly SessionStoreTarget[] | undefined;
   // Discover stores after admitted writes finish, using the retiring configuration.
+  // Every plugin shares this list, so deleted-agent stores are read and logged once.
   const resolveSessionStoreTargets = () =>
-    (sessionStoreTargets ??= resolveAllAgentSessionStoreTargetsSync(cfg ?? getRuntimeConfig()));
+    (sessionStoreTargets ??= resolveRetiringSessionStoreTargets(cfg ?? getRuntimeConfig()));
   const waits: PluginHostRegistryRetirement[] = [];
   for (const pluginId of previousPluginIds) {
     const record = previousRegistry.plugins.find((entry) => entry.id === pluginId);

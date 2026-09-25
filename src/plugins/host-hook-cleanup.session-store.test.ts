@@ -1,7 +1,8 @@
 // Verifies host hook cleanup behavior for session-store state.
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   loadSessionEntry,
   patchSessionEntryCore,
@@ -23,8 +24,34 @@ import {
 } from "../state/openclaw-state-db.js";
 import { captureEnv, setTestEnvValue } from "../test-utils/env.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
-import { runPluginHostCleanup } from "./host-hook-cleanup.js";
+import { createPluginHostRegistryRetirement, runPluginHostCleanup } from "./host-hook-cleanup.js";
+import { PluginInstance } from "./plugin-instance.js";
 import { createEmptyPluginRegistry } from "./registry-empty.js";
+import { createPluginRecord } from "./status.test-helpers.js";
+
+const mocks = vi.hoisted(() => ({ cleanupInfo: vi.fn(), snapshots: vi.fn() }));
+
+vi.mock("../logging/subsystem.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../logging/subsystem.js")>();
+  return {
+    ...actual,
+    createSubsystemLogger: (subsystem: string) => {
+      const logger = actual.createSubsystemLogger(subsystem);
+      return subsystem === "plugins/cleanup" ? { ...logger, info: mocks.cleanupInfo } : logger;
+    },
+  };
+});
+
+vi.mock("../infra/sqlite-snapshot-source.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../infra/sqlite-snapshot-source.js")>();
+  return {
+    ...actual,
+    prepareSqliteReadOnlyLocationSync: (pathname: string) => {
+      mocks.snapshots(pathname);
+      return actual.prepareSqliteReadOnlyLocationSync(pathname);
+    },
+  };
+});
 
 describe("plugin host cleanup session stores", () => {
   let stateDir: string | undefined;
@@ -106,40 +133,37 @@ describe("plugin host cleanup session stores", () => {
     }
   });
 
-  it.each([
-    ["finished", true],
-    ["unfinished", false],
-  ] as const)(
-    "cleans live agent state without opening a store kept by a %s agent deletion",
-    async (_, cleanupCompleted) => {
-      await withOpenClawTestState(
-        { layout: "state-only", prefix: "openclaw-cleanup-deleted-agent-" },
-        async (state) => {
-          const scopeFor = (agentId: string) => ({
-            agentId,
-            sessionKey: `agent:${agentId}:main`,
-            storePath: path.join(state.sessionsDir(agentId), "sessions.json"),
+  it("retires 16 plugins on a cold state handle without opening deleted agents' kept stores", async () => {
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-cleanup-deleted-agent-" },
+      async (state) => {
+        const scopeFor = (agentId: string) => ({
+          agentId,
+          sessionKey: `agent:${agentId}:main`,
+          storePath: path.join(state.sessionsDir(agentId), "sessions.json"),
+        });
+        // Discovery sorts agent folders: the live "work" store follows both kept stores.
+        const live = [scopeFor("main"), scopeFor("work")];
+        const kept = [scopeFor("finished"), scopeFor("unfinished")];
+        const pluginIds = Array.from({ length: 16 }, (_, index) => `fixture-${index}`);
+        const pluginExtensions = Object.fromEntries(pluginIds.map((id) => [id, { active: true }]));
+        for (const scope of [...live, ...kept]) {
+          await replaceSessionEntry(scope, {
+            sessionId: scope.agentId,
+            updatedAt: 1,
+            pluginExtensions,
           });
-          // Discovery sorts agent folders: the live "work" store follows the kept "retired" one.
-          const main = scopeFor("main");
-          const retired = scopeFor("retired");
-          const work = scopeFor("work");
-          for (const scope of [main, retired, work]) {
-            await replaceSessionEntry(scope, {
-              sessionId: scope.agentId,
-              updatedAt: 1,
-              pluginExtensions: { fixture: { active: true } },
-            });
-          }
+        }
+        for (const { agentId } of kept) {
           const deletion = beginAgentDeletionJournal({
-            agentId: "retired",
-            operationId: "retire-operation",
-            agentDir: state.agentDir("retired"),
-            workspaceDir: state.path("workspace-retired"),
-            sessionsDir: state.sessionsDir("retired"),
+            agentId,
+            operationId: `delete-${agentId}`,
+            agentDir: state.agentDir(agentId),
+            workspaceDir: state.path(`workspace-${agentId}`),
+            sessionsDir: state.sessionsDir(agentId),
             deleteFiles: false,
           });
-          if (cleanupCompleted) {
+          if (agentId === "finished") {
             runOpenClawStateWriteTransaction((database) =>
               completeAgentDeletionJournalInDatabase(
                 database,
@@ -148,25 +172,58 @@ describe("plugin host cleanup session stores", () => {
               ),
             );
           }
-          closeOpenClawAgentDatabasesForTest();
-          const retainedPath = path.join(state.agentDir("retired"), "openclaw-agent.sqlite");
-          const retainedBytes = await fs.readFile(retainedPath);
+        }
+        closeOpenClawAgentDatabasesForTest();
+        const hashKeptDatabases = () =>
+          Promise.all(
+            kept.map(async ({ agentId }) =>
+              createHash("sha256")
+                .update(
+                  await fs.readFile(path.join(state.agentDir(agentId), "openclaw-agent.sqlite")),
+                )
+                .digest("hex"),
+            ),
+          );
+        const keptHashes = await hashKeptDatabases();
+        // Live agent handles stay open while the idle shared-state handle is retired.
+        for (const scope of live) {
+          loadSessionEntry(scope);
+        }
+        closeOpenClawStateDatabaseForTest();
+        const registry = createEmptyPluginRegistry();
+        const instances = pluginIds.map((id) => {
+          const record = createPluginRecord({ id });
+          registry.plugins.push(record);
+          return new PluginInstance(record.id, { record, registry });
+        });
+        mocks.cleanupInfo.mockClear();
+        mocks.snapshots.mockClear();
 
-          const result = await runPluginHostCleanup({
-            cfg: {},
-            registry: createEmptyPluginRegistry(),
-            pluginId: "fixture",
-            reason: "disable",
-          });
+        const result = await createPluginHostRegistryRetirement({
+          cfg: {},
+          previousRegistry: registry,
+        })();
 
-          expect(result).toEqual({ cleanupCount: 2, failures: [] });
-          expect(loadSessionEntry(main)?.pluginExtensions).toBeUndefined();
-          expect(loadSessionEntry(work)?.pluginExtensions).toBeUndefined();
-          expect(await fs.readFile(retainedPath)).toEqual(retainedBytes);
-        },
-      );
-    },
-  );
+        // No fence errors and no forced retirement after the 5 s shutdown budget.
+        expect(result).toEqual({ cleanupCount: 32, failures: [] });
+        expect(instances.every((instance) => instance.disposing)).toBe(true);
+        // One cold journal read serves every plugin and store.
+        expect(mocks.snapshots).toHaveBeenCalledOnce();
+        expect(mocks.cleanupInfo.mock.calls).toEqual(
+          kept.map(({ agentId }) => [
+            expect.stringMatching(
+              new RegExp(`^Skipping plugin session cleanup for deleted agent ${agentId} store `),
+            ),
+          ]),
+        );
+        expect(await hashKeptDatabases()).toEqual(keptHashes);
+        closeOpenClawAgentDatabasesForTest();
+        for (const scope of live) {
+          expect(loadSessionEntry(scope)?.pluginExtensions).toBeUndefined();
+        }
+      },
+    );
+  });
 
   it.each(["cancelled", "already-cleared", "locked", "revoked", "committed"] as const)(
     "revalidates queued cleanup and counts only committed changes (%s)",
