@@ -48,6 +48,10 @@ function countNoProgressStreak(
     if (typeof record.resultHash !== "string" || !record.resultHash) {
       continue;
     }
+    if (terminalExecFailuresOnly && record.outcomeKind === "argument-validation") {
+      // Rejected arguments never ran, so they neither extend nor end a failure tail.
+      continue;
+    }
     if (terminalExecFailuresOnly && record.outcomeKind !== "terminal-exec-failure") {
       break;
     }

@@ -1,9 +1,17 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { runAgentLoop, type StreamFn } from "openclaw/plugin-sdk/agent-core";
+import {
+  createAssistantMessageEventStream,
+  type AssistantMessage,
+  type Message,
+} from "openclaw/plugin-sdk/llm";
+import { Type } from "typebox";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { onDiagnosticEvent, resetDiagnosticEventsForTest } from "../infra/diagnostic-events.js";
 import {
   getDiagnosticSessionState,
   resetDiagnosticSessionStateForTest,
 } from "../logging/diagnostic-session-state.js";
+import { wrapToolWithBeforeToolCallHook } from "./agent-tools.before-tool-call.js";
 import { runBeforeToolCallHook } from "./agent-tools.before-tool-call.policy.js";
 import {
   clearBatchAdmittedToolCallsForRun,
@@ -11,6 +19,8 @@ import {
   resetAdjustedParamsByToolCallIdForTests,
 } from "./agent-tools.before-tool-call.state.js";
 import type { HookContext } from "./agent-tools.before-tool-call.types.js";
+import { createToolLoopBatchAdmission } from "./embedded-agent-runner/run/tool-loop-recovery.js";
+import { createZeroUsageFixture } from "./test-helpers/usage-fixtures.js";
 import { admitToolCallBatch } from "./tool-loop-admission.js";
 import { recordToolCall, recordToolCallOutcome } from "./tool-loop-detection.js";
 
@@ -26,6 +36,16 @@ function call(id: string, name: string, args: Record<string, unknown>) {
   return {
     toolCall: { type: "toolCall" as const, id, name, arguments: args },
     args,
+  };
+}
+
+function rejectedCall(id: string, name: string, args: Record<string, unknown>) {
+  return {
+    ...call(id, name, args),
+    validationFailure: {
+      content: [{ type: "text" as const, text: `Validation failed for tool "${name}"` }],
+      details: {},
+    },
   };
 }
 
@@ -86,37 +106,172 @@ describe("whole-batch tool-loop admission", () => {
     },
   );
 
-  it("escalates repeated argument-validation failures that never launch", async () => {
+  it("records argument-validation failures at launch and escalates their repeats", async () => {
     const state = getDiagnosticSessionState(ctx);
-    const rejected = (id: string) => ({
-      ...call(id, "exec", {}),
-      validationFailure: {
-        content: [{ type: "text" as const, text: "Validation failed: command is required" }],
-        details: {},
-      },
-    });
+    const skipped = rejectedCall("skipped", "exec", {});
+    const skippedAdmission = await admitToolCallBatch([skipped], ctx);
+    skippedAdmission.releaseSkippedCalls?.([skipped.toolCall.id]);
+    skippedAdmission.commitReadyCalls?.([{ toolCallId: skipped.toolCall.id, args: skipped.args }]);
+    // A released rejection is dropped, even if a stale launch commit follows.
+    expect(state.toolCallHistory ?? []).toEqual([]);
+
     const warnings: unknown[] = [];
-    const markedIds: string[] = [];
     for (let index = 0; index < 20; index += 1) {
-      const candidate = rejected(`invalid-${index}`);
+      const candidate = rejectedCall(`invalid-${index}`, "exec", {});
       const admission = await admitToolCallBatch([candidate], ctx);
       expect(admission.intervention).toBeUndefined();
       warnings.push(...(admission.warnings ?? []));
-      if (consumeBatchAdmittedToolCall(candidate.toolCall.id, ctx.runId)) {
-        markedIds.push(candidate.toolCall.id);
-      }
+      // Rejected calls never reach the tool wrapper, so admission reserves no marker.
+      expect(consumeBatchAdmittedToolCall(candidate.toolCall.id, ctx.runId)).toBe(false);
+      expect(state.toolCallHistory ?? []).toHaveLength(index);
+      admission.commitReadyCalls?.([{ toolCallId: candidate.toolCall.id, args: candidate.args }]);
     }
-    expect(state.toolCallHistory ?? []).toHaveLength(20);
+    expect(state.toolCallHistory).toHaveLength(20);
+    expect(state.toolCallHistory?.at(-1)).toMatchObject({
+      toolCallId: "invalid-19",
+      outcomeKind: "argument-validation",
+      resultHash: expect.any(String),
+    });
     expect(warnings).toEqual([{ kind: "tool-loop-warning", toolCallId: "invalid-10", count: 10 }]);
-    // Rejected calls never reach the launch commit, so admission leaves no marker.
-    expect(markedIds).toEqual([]);
-    await expect(admitToolCallBatch([rejected("critical")], ctx)).resolves.toMatchObject({
+    await expect(
+      admitToolCallBatch([rejectedCall("critical", "exec", {})], ctx),
+    ).resolves.toMatchObject({
       intervention: {
         kind: "critical-tool-loop",
         toolCallId: "critical",
         detector: "generic_repeat",
         count: 20,
       },
+    });
+  });
+
+  it("keeps a terminal exec failure streak across rejected exec calls", async () => {
+    const state = getDiagnosticSessionState(ctx);
+    const failure = {
+      content: [{ type: "text" as const, text: "Traceback: missing package" }],
+      details: { status: "completed", exitCode: 1, aggregated: "Traceback: missing package" },
+    };
+    for (let index = 0; index < 20; index += 1) {
+      const job = call(`job-${index}`, "exec", { command: `python job-${index}.py` });
+      const batch = index % 4 === 0 ? [job, rejectedCall(`invalid-${index}`, "exec", {})] : [job];
+      const admission = await admitToolCallBatch(batch, ctx);
+      expect(admission.intervention).toBeUndefined();
+      admission.commitReadyCalls?.(
+        batch.map((entry) => ({ toolCallId: entry.toolCall.id, args: entry.args })),
+      );
+      recordToolCallOutcome(state, {
+        toolName: "exec",
+        toolParams: job.args,
+        toolCallId: job.toolCall.id,
+        result: failure,
+        runId: ctx.runId,
+      });
+    }
+
+    await expect(
+      admitToolCallBatch([call("next", "exec", { command: "python next.py" })], ctx),
+    ).resolves.toMatchObject({
+      intervention: { toolCallId: "next", detector: "generic_repeat", count: 20 },
+    });
+  });
+
+  it("blocks a repeated batch that mixes a valid call with a rejected one", async () => {
+    const hookCtx = { ...ctx, runId: "run-mixed" };
+    const readExecute = vi.fn(async () => ({
+      content: [{ type: "text" as const, text: "unchanged" }],
+      details: {},
+    }));
+    const execExecute = vi.fn(async () => ({ content: [], details: {} }));
+    const tools = [
+      wrapToolWithBeforeToolCallHook(
+        {
+          name: "read",
+          label: "read",
+          description: "read",
+          parameters: Type.Object({ path: Type.String() }),
+          execute: readExecute,
+        },
+        hookCtx,
+      ),
+      wrapToolWithBeforeToolCallHook(
+        {
+          name: "exec",
+          label: "exec",
+          description: "exec",
+          parameters: Type.Object({ command: Type.String() }),
+          execute: execExecute,
+        },
+        hookCtx,
+      ),
+    ];
+    const turnCap = 40;
+    let turn = 0;
+    const streamFn: StreamFn = () => {
+      turn += 1;
+      const message: AssistantMessage = {
+        role: "assistant",
+        content:
+          turn <= turnCap
+            ? [
+                { type: "toolCall", id: `read-${turn}`, name: "read", arguments: { path: "a" } },
+                { type: "toolCall", id: `exec-${turn}`, name: "exec", arguments: {} },
+              ]
+            : [{ type: "text", text: "gave up" }],
+        api: "faux",
+        provider: "faux",
+        model: "faux-1",
+        usage: createZeroUsageFixture(),
+        stopReason: turn <= turnCap ? "toolUse" : "stop",
+        timestamp: turn,
+      };
+      const stream = createAssistantMessageEventStream();
+      queueMicrotask(() => {
+        stream.push({
+          type: "done",
+          reason: message.stopReason === "toolUse" ? "toolUse" : "stop",
+          message,
+        });
+        stream.end();
+      });
+      return stream;
+    };
+
+    const messages = await runAgentLoop(
+      [{ role: "user", content: "keep going", timestamp: 0 }],
+      { systemPrompt: "", messages: [], tools },
+      {
+        model: {
+          id: "faux-1",
+          name: "Faux",
+          api: "faux",
+          provider: "faux",
+          baseUrl: "https://example.test",
+          reasoning: false,
+          input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 1_000,
+          maxTokens: 1_000,
+        },
+        convertToLlm: (entries) => entries as Message[],
+        beforeToolBatch: createToolLoopBatchAdmission(hookCtx),
+      },
+      () => {},
+      undefined,
+      streamFn,
+    );
+
+    const firstBlocked = messages.find(
+      (message) =>
+        message.role === "toolResult" &&
+        (message.details as { deniedReason?: string } | undefined)?.deniedReason === "tool-loop",
+    );
+    // In assistant order the pair alternates, so ping-pong detection blocks it.
+    expect(firstBlocked).toMatchObject({ toolCallId: "read-11" });
+    expect(execExecute).not.toHaveBeenCalled();
+    expect(turn).toBeLessThan(turnCap);
+    expect(messages.at(-1)).toMatchObject({
+      role: "assistant",
+      content: [{ type: "text", text: expect.stringContaining("tool-loop recovery") }],
     });
   });
 

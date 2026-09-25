@@ -63,7 +63,10 @@ export interface InternalToolBatchCall {
   args: unknown;
   /** Resolved tool identity for OpenClaw-owned argument canonicalization. */
   tool?: AgentTool;
-  /** Error result for a call rejected by argument validation; it never executes. */
+  /**
+   * Error result for a call rejected by argument validation. It never executes;
+   * the batch lifecycle commits it at its assistant-order launch position.
+   */
   validationFailure?: AgentToolResult<unknown>;
 }
 
