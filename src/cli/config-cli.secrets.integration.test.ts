@@ -639,6 +639,58 @@ describe("config cli secrets integration", () => {
     );
   });
 
+  it.each([
+    { target: "notARealSection.key", schemaError: 'Unrecognized key: "notARealSection"' },
+    { target: "hooks.token", schemaError: "SecretRef objects are not supported at hooks.token" },
+    { target: "channels.discord.token", schemaError: undefined },
+  ])(
+    "runs the schema pass in a ref-builder dry run unless $target is a registered SecretRef target",
+    async ({ target, schemaError }) => {
+      await withConfigFileHarness(
+        "openclaw-config-cli-ref-builder-dry-run-",
+        "{ gateway: { port: 18789 } }\n",
+        async ({ configPath }) => {
+          const envSnapshot = captureEnv(["DRY_RUN_REF_TOKEN"]);
+          try {
+            setTestEnvValue("DRY_RUN_REF_TOKEN", "synthetic-token");
+            const raw = fs.readFileSync(configPath, "utf8");
+            const output = createTestRuntime();
+            const run = runConfigSet({
+              path: target,
+              cliOptions: {
+                refProvider: "default",
+                refSource: "env",
+                refId: "DRY_RUN_REF_TOKEN",
+                dryRun: true,
+                json: true,
+              },
+              runtime: output.runtime,
+            });
+
+            if (schemaError) {
+              await expect(run).rejects.toThrow("__exit__:1");
+            } else {
+              await run;
+            }
+            expect(fs.readFileSync(configPath, "utf8")).toBe(raw);
+            expect(output.errors).toStrictEqual([]);
+            expect(JSON.parse(output.logs.join("\n"))).toMatchObject(
+              schemaError
+                ? {
+                    ok: false,
+                    checks: { schema: true },
+                    errors: [{ kind: "schema", message: expect.stringContaining(schemaError) }],
+                  }
+                : { ok: true, checks: { schema: false, resolvability: true } },
+            );
+          } finally {
+            envSnapshot.restore();
+          }
+        },
+      );
+    },
+  );
+
   it("skips exec provider execution during dry-run by default", async () => {
     await withExecDryRunConfigHarness("openclaw-config-cli-int-exec-skip-", async (params) => {
       const before = fs.readFileSync(params.configPath, "utf8");
