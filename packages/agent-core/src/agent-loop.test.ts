@@ -36,6 +36,7 @@ import type {
   AgentMessage,
   AgentTool,
   AgentToolResult,
+  InternalToolBatchCall,
   StreamFn,
 } from "./types.js";
 
@@ -1745,7 +1746,7 @@ describe("agentLoop tool termination", () => {
     const commitReadyCalls = vi.fn();
     const releaseSkippedCalls = vi.fn();
     setInternalBeforeToolBatch(agent, async ({ calls }) => {
-      expect(calls.map((call) => call.toolCall.id)).toEqual(["valid-tail"]);
+      expect(calls.map((call) => call.toolCall.id)).toEqual(["invalid-tail", "valid-tail"]);
       return attachInternalToolBatchLifecycle({}, { commitReadyCalls, releaseSkippedCalls });
     });
     agent.subscribe((event) => {
@@ -1807,7 +1808,7 @@ describe("agentLoop tool termination", () => {
     const commitReadyCalls = vi.fn();
     const releaseSkippedCalls = vi.fn();
     setInternalBeforeToolBatch(agent, async ({ calls }) => {
-      expect(calls.map((call) => call.toolCall.id)).toEqual(["prepared"]);
+      expect(calls.map((call) => call.toolCall.id)).toEqual(["invalid", "prepared"]);
       return attachInternalToolBatchLifecycle({}, { commitReadyCalls, releaseSkippedCalls });
     });
     const events: AgentEvent[] = [];
@@ -2258,6 +2259,70 @@ describe("agentLoop tool termination", () => {
         } => event.type === "message_end" && event.message.role === "toolResult",
       )?.message,
     ).toMatchObject({
+      details: { status: "blocked", deniedReason: "tool-loop" },
+    });
+  });
+
+  it("admits argument-validation failures so a repeated rejected call reaches loop recovery", async () => {
+    const executed: string[] = [];
+    const admittedCalls: InternalToolBatchCall[][] = [];
+    let turn = 0;
+    const streamFn = createTurnSequenceStream(
+      [
+        [{ type: "toolCall", id: "invalid-1", name: "edit", arguments: {} }],
+        [{ type: "text", text: "recovered" }],
+      ],
+      [],
+      (_context, currentTurn) => {
+        turn = currentTurn;
+      },
+    );
+    const tool: AgentTool = {
+      ...makeTool("edit", executed),
+      parameters: Type.Object({ path: Type.String() }, { additionalProperties: false }),
+    };
+    const events = await collectEvents(
+      captureAgentLoop(
+        [{ role: "user", content: "run", timestamp: 1 }],
+        { systemPrompt: "", messages: [], tools: [tool] },
+        {
+          ...config,
+          beforeToolBatch: async ({ calls }) => {
+            admittedCalls.push(calls);
+            const first = calls[0];
+            return first ? { intervention: criticalLoopFor(first.toolCall) } : undefined;
+          },
+        },
+        undefined,
+        streamFn,
+      ),
+    );
+
+    expect(admittedCalls).toEqual([
+      [
+        {
+          toolCall: expect.objectContaining({ id: "invalid-1", name: "edit" }),
+          args: {},
+          validationFailure: {
+            content: [{ type: "text", text: expect.stringContaining("path") }],
+            details: {},
+          },
+        },
+      ],
+    ]);
+    expect(turn).toBe(2);
+    expect(executed).toEqual([]);
+    expect(
+      events.find(
+        (
+          event,
+        ): event is Extract<AgentEvent, { type: "message_end" }> & {
+          message: { role: "toolResult" };
+        } => event.type === "message_end" && event.message.role === "toolResult",
+      )?.message,
+    ).toMatchObject({
+      toolCallId: "invalid-1",
+      isError: true,
       details: { status: "blocked", deniedReason: "tool-loop" },
     });
   });

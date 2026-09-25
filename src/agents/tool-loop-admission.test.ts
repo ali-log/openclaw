@@ -86,6 +86,40 @@ describe("whole-batch tool-loop admission", () => {
     },
   );
 
+  it("escalates repeated argument-validation failures that never launch", async () => {
+    const state = getDiagnosticSessionState(ctx);
+    const rejected = (id: string) => ({
+      ...call(id, "exec", {}),
+      validationFailure: {
+        content: [{ type: "text" as const, text: "Validation failed: command is required" }],
+        details: {},
+      },
+    });
+    const warnings: unknown[] = [];
+    const markedIds: string[] = [];
+    for (let index = 0; index < 20; index += 1) {
+      const candidate = rejected(`invalid-${index}`);
+      const admission = await admitToolCallBatch([candidate], ctx);
+      expect(admission.intervention).toBeUndefined();
+      warnings.push(...(admission.warnings ?? []));
+      if (consumeBatchAdmittedToolCall(candidate.toolCall.id, ctx.runId)) {
+        markedIds.push(candidate.toolCall.id);
+      }
+    }
+    expect(state.toolCallHistory ?? []).toHaveLength(20);
+    expect(warnings).toEqual([{ kind: "tool-loop-warning", toolCallId: "invalid-10", count: 10 }]);
+    // Rejected calls never reach the launch commit, so admission leaves no marker.
+    expect(markedIds).toEqual([]);
+    await expect(admitToolCallBatch([rejected("critical")], ctx)).resolves.toMatchObject({
+      intervention: {
+        kind: "critical-tool-loop",
+        toolCallId: "critical",
+        detector: "generic_repeat",
+        count: 20,
+      },
+    });
+  });
+
   it("returns a typed critical intervention and records only veto evidence", async () => {
     const state = getDiagnosticSessionState({
       sessionKey: ctx.sessionKey,

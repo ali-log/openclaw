@@ -148,6 +148,7 @@ export async function admitToolCallBatch(
     markDiagnosticArgumentChurnObservation,
     reconcileToolCallExecutionParams,
     recordToolCall,
+    recordToolCallOutcome,
     resolveToolLoopWarningThreshold,
   } = await loadBeforeToolCallRuntime();
   const warningThreshold = resolveToolLoopWarningThreshold();
@@ -222,7 +223,28 @@ export async function admitToolCallBatch(
     projectLoopVeto(call);
   }
   for (const call of calls) {
-    recordBatchAdmittedToolCall(call.toolCall.id, ctx.runId);
+    if (!call.validationFailure) {
+      recordBatchAdmittedToolCall(call.toolCall.id, ctx.runId);
+      continue;
+    }
+    // Rejected arguments never reach the launch commit; their outcome is already known.
+    const toolName = normalizeToolPolicyName(call.toolCall.name || "tool");
+    recordToolCall(
+      sessionState,
+      toolName,
+      call.args,
+      call.toolCall.id,
+      ctx.loopDetection,
+      ctx.runId ? { runId: ctx.runId } : undefined,
+    );
+    recordToolCallOutcome(sessionState, {
+      toolName,
+      toolParams: call.args,
+      toolCallId: call.toolCall.id,
+      result: call.validationFailure,
+      config: ctx.loopDetection,
+      runId: ctx.runId,
+    });
   }
   const admittedById = new Map(
     calls.map((call) => [

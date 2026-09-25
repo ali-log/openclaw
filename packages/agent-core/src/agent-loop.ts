@@ -36,6 +36,7 @@ import type {
   AgentTool,
   AgentToolCall,
   AgentToolResult,
+  InternalToolBatchCall,
   StreamFn,
   ToolLoopIntervention,
   ToolLoopWarning,
@@ -480,10 +481,14 @@ async function executeToolCalls(
       }
       batch.validated.set(toolCall, await validateToolCallForBatchAdmission(batch, toolCall));
     }
-    const calls = toolCalls.flatMap((toolCall) => {
+    const calls = toolCalls.flatMap((toolCall): InternalToolBatchCall[] => {
       const validation = batch.validated.get(toolCall);
-      return validation?.kind === "prepared"
-        ? [{ toolCall, args: validation.args, tool: validation.tool }]
+      if (validation?.kind === "prepared") {
+        return [{ toolCall, args: validation.args, tool: validation.tool }];
+      }
+      // Rejected arguments never execute, but repeating them is still a tool loop.
+      return validation?.errorKind === "argument-validation"
+        ? [{ toolCall, args: toolCall.arguments, validationFailure: validation.result }]
         : [];
     });
     if (calls.length > 0 && !signal?.aborted) {

@@ -56,12 +56,15 @@ export interface BeforeToolCallResult {
   reason?: string;
 }
 
-/** A validated call participating in an internal whole-batch admission check. */
+/** A call participating in an internal whole-batch admission check. */
 export interface InternalToolBatchCall {
   toolCall: AgentToolCall;
+  /** Validated arguments, or the raw arguments when validation rejected the call. */
   args: unknown;
   /** Resolved tool identity for OpenClaw-owned argument canonicalization. */
   tool?: AgentTool;
+  /** Error result for a call rejected by argument validation; it never executes. */
+  validationFailure?: AgentToolResult<unknown>;
 }
 
 /** Typed core signal used to recover once from a critical tool loop. */
