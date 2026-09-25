@@ -9,7 +9,9 @@ import {
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { normalizeAgentId } from "../routing/session-key.js";
 import { readAgentDatabaseAdmissionRefusal } from "../state/agent-database-admission.js";
+import { listAgentDeletionJournals } from "../state/agent-deletion-journal.js";
 import { appendPluginInstanceCleanupFailures } from "./host-hook-cleanup-result.js";
 import { withPluginHostCleanupTimeout } from "./host-hook-cleanup-timeout.js";
 import type {
@@ -296,6 +298,23 @@ function collectRestartPromotedSessionEntrySlotKeys(
   return staleSlotKeys;
 }
 
+/** Like startup, leave stores of finished and unfinished agent deletions to their fence. */
+function resolveRetiringSessionStoreTargets(cfg: OpenClawConfig): SessionStoreTarget[] {
+  const targets = resolveAllAgentSessionStoreTargetsSync(cfg);
+  const deletedAgentIds = new Set(
+    listAgentDeletionJournals({}, "runtime").map((deletion) => deletion.agentId),
+  );
+  return targets.filter((target) => {
+    if (!deletedAgentIds.has(normalizeAgentId(target.agentId))) {
+      return true;
+    }
+    log.info(
+      `Skipping plugin session cleanup for deleted agent ${target.agentId} store ${target.storePath}`,
+    );
+    return false;
+  });
+}
+
 /** Prepares one retirement; each waiter keeps its caller's exact instance admission. */
 export function createPluginHostRegistryRetirement(params: {
   cfg?: OpenClawConfig;
@@ -324,8 +343,9 @@ export function createPluginHostRegistryRetirement(params: {
   ]);
   let sessionStoreTargets: readonly SessionStoreTarget[] | undefined;
   // Discover stores after admitted writes finish, using the retiring configuration.
+  // Every plugin shares this list, so deleted-agent stores are read and logged once.
   const resolveSessionStoreTargets = () =>
-    (sessionStoreTargets ??= resolveAllAgentSessionStoreTargetsSync(cfg ?? getRuntimeConfig()));
+    (sessionStoreTargets ??= resolveRetiringSessionStoreTargets(cfg ?? getRuntimeConfig()));
   const waits: PluginHostRegistryRetirement[] = [];
   for (const pluginId of previousPluginIds) {
     const record = previousRegistry.plugins.find((entry) => entry.id === pluginId);

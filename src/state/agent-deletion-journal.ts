@@ -387,6 +387,19 @@ export function readAgentDeletionJournal(
   );
 }
 
+/** Read every finished and unfinished deletion through one shared-state read. */
+export function listAgentDeletionJournals(
+  options: OpenClawStateDatabaseOptions = {},
+  purpose: AgentDeletionJournalPurpose = "maintenance",
+): AgentDeletionJournalEntry[] {
+  return (
+    withExistingOpenClawStateDatabaseCurrentReadOnly(
+      (database) => readAgentDeletionPathFenceRows(database.db, purpose).rows.map(fromRow),
+      options,
+    ) ?? []
+  );
+}
+
 export function beginAgentDeletionJournal(
   entry: Omit<
     AgentDeletionJournalEntry,
