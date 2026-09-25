@@ -11,10 +11,18 @@ import type { SessionEntry } from "../config/sessions/types.js";
 import { resolvePreferredOpenClawTmpDir } from "../infra/tmp-openclaw-dir.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { recordAgentDatabaseAdmissions } from "../state/agent-database-admission.js";
+import {
+  beginAgentDeletionJournal,
+  completeAgentDeletionJournalInDatabase,
+} from "../state/agent-deletion-journal.js";
 import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
 import { SQLITE_SESSION_WRITER_QUEUES } from "../state/openclaw-agent-write-admission.js";
-import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
+import {
+  closeOpenClawStateDatabaseForTest,
+  runOpenClawStateWriteTransaction,
+} from "../state/openclaw-state-db.js";
 import { captureEnv, setTestEnvValue } from "../test-utils/env.js";
+import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { runPluginHostCleanup } from "./host-hook-cleanup.js";
 import { createEmptyPluginRegistry } from "./registry-empty.js";
 
@@ -97,6 +105,68 @@ describe("plugin host cleanup session stores", () => {
       recordAgentDatabaseAdmissions([]);
     }
   });
+
+  it.each([
+    ["finished", true],
+    ["unfinished", false],
+  ] as const)(
+    "cleans live agent state without opening a store kept by a %s agent deletion",
+    async (_, cleanupCompleted) => {
+      await withOpenClawTestState(
+        { layout: "state-only", prefix: "openclaw-cleanup-deleted-agent-" },
+        async (state) => {
+          const scopeFor = (agentId: string) => ({
+            agentId,
+            sessionKey: `agent:${agentId}:main`,
+            storePath: path.join(state.sessionsDir(agentId), "sessions.json"),
+          });
+          // Discovery sorts agent folders: the live "work" store follows the kept "retired" one.
+          const main = scopeFor("main");
+          const retired = scopeFor("retired");
+          const work = scopeFor("work");
+          for (const scope of [main, retired, work]) {
+            await replaceSessionEntry(scope, {
+              sessionId: scope.agentId,
+              updatedAt: 1,
+              pluginExtensions: { fixture: { active: true } },
+            });
+          }
+          const deletion = beginAgentDeletionJournal({
+            agentId: "retired",
+            operationId: "retire-operation",
+            agentDir: state.agentDir("retired"),
+            workspaceDir: state.path("workspace-retired"),
+            sessionsDir: state.sessionsDir("retired"),
+            deleteFiles: false,
+          });
+          if (cleanupCompleted) {
+            runOpenClawStateWriteTransaction((database) =>
+              completeAgentDeletionJournalInDatabase(
+                database,
+                deletion.agentId,
+                deletion.operationId,
+              ),
+            );
+          }
+          closeOpenClawAgentDatabasesForTest();
+          const retainedPath = path.join(state.agentDir("retired"), "openclaw-agent.sqlite");
+          const retainedBytes = await fs.readFile(retainedPath);
+
+          const result = await runPluginHostCleanup({
+            cfg: {},
+            registry: createEmptyPluginRegistry(),
+            pluginId: "fixture",
+            reason: "disable",
+          });
+
+          expect(result).toEqual({ cleanupCount: 2, failures: [] });
+          expect(loadSessionEntry(main)?.pluginExtensions).toBeUndefined();
+          expect(loadSessionEntry(work)?.pluginExtensions).toBeUndefined();
+          expect(await fs.readFile(retainedPath)).toEqual(retainedBytes);
+        },
+      );
+    },
+  );
 
   it.each(["cancelled", "already-cleared", "locked", "revoked", "committed"] as const)(
     "revalidates queued cleanup and counts only committed changes (%s)",

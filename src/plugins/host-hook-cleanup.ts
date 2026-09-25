@@ -2,14 +2,18 @@ import { normalizeOptionalAgentRuntimeId } from "../agents/agent-runtime-id.js";
 import { getRuntimeConfig } from "../config/config.js";
 import { getRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
 import { cleanupPluginHostSessionStore } from "../config/sessions/session-accessor.js";
+import { resolveSqliteTargetFromSessionStorePath } from "../config/sessions/session-sqlite-target.js";
 import {
   resolveAllAgentSessionStoreTargetsSync,
+  resolveConfiguredAgentDatabaseTargets,
   type SessionStoreTarget,
 } from "../config/sessions/targets.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { readAgentDatabaseAdmissionRefusal } from "../state/agent-database-admission.js";
+import { createRetainedAgentDatabaseMatcher } from "../state/agent-deletion-discovery.js";
+import { readAgentDeletionJournal } from "../state/agent-deletion-journal.js";
 import { appendPluginInstanceCleanupFailures } from "./host-hook-cleanup-result.js";
 import { withPluginHostCleanupTimeout } from "./host-hook-cleanup-timeout.js";
 import type {
@@ -39,6 +43,36 @@ function shouldCleanPlugin(pluginId: string, filterPluginId?: string): boolean {
   return !filterPluginId || pluginId === filterPluginId;
 }
 
+// A retirement shares its resolved targets across plugins; report each skipped store once.
+const reportedDeletedAgentStores = new WeakSet<SessionStoreTarget>();
+
+/** Like startup, leave stores of finished and unfinished agent deletions to their fence. */
+function isDeletedAgentSessionStore(cfg: OpenClawConfig, target: SessionStoreTarget): boolean {
+  const env = process.env;
+  const deletion =
+    readAgentDeletionJournal(target.agentId, { env }, "runtime") ??
+    createRetainedAgentDatabaseMatcher(
+      env,
+      () => resolveConfiguredAgentDatabaseTargets(cfg, { env }),
+      "database",
+      "runtime",
+    )(
+      resolveSqliteTargetFromSessionStorePath(target.storePath, { agentId: target.agentId, env })
+        .path,
+      target.agentId,
+    );
+  if (typeof deletion !== "object") {
+    return false;
+  }
+  if (!reportedDeletedAgentStores.has(target)) {
+    reportedDeletedAgentStores.add(target);
+    log.info(
+      `Skipping plugin session cleanup for deleted agent ${deletion.agentId} store ${target.storePath}`,
+    );
+  }
+  return true;
+}
+
 async function clearPluginSessionStores(params: {
   cfg: OpenClawConfig;
   mode: "plugin-owned-state" | "promoted-slots";
@@ -65,7 +99,10 @@ async function clearPluginSessionStores(params: {
     if (params.shouldCleanup && !params.shouldCleanup()) {
       break;
     }
-    if (readAgentDatabaseAdmissionRefusal(target.agentId)) {
+    if (
+      readAgentDatabaseAdmissionRefusal(target.agentId) ||
+      isDeletedAgentSessionStore(params.cfg, target)
+    ) {
       continue;
     }
     cleared += await cleanupPluginHostSessionStore({
