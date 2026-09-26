@@ -62,7 +62,7 @@ async function runComposedLoop(runId: string, callsForTurn: (turn: number) => To
     content: [{ type: "text" as const, text: "unchanged" }],
     details: {},
   }));
-  const execExecute = vi.fn(async () => execFailure);
+  const execExecute = vi.fn(async (_toolCallId: string, _params: unknown) => execFailure);
   const tools = [
     wrapToolWithBeforeToolCallHook(
       {
