@@ -199,7 +199,10 @@ export function copyInternalToolResultState<T extends object>(source: object, ta
   return target;
 }
 
-/** Call only after raw outcome recording: feedback must not change no-progress hashes. */
+/**
+ * Feedback must not change no-progress hashes: call only after raw outcome
+ * recording, or for rejected calls whose validation result admission captured.
+ */
 export function appendToolLoopWarning<T extends AgentToolResult<unknown>>(
   result: T,
   warning: ToolLoopWarning,

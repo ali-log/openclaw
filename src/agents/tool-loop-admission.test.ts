@@ -1,12 +1,10 @@
-import { runAgentLoop, type StreamFn } from "openclaw/plugin-sdk/agent-core";
-import {
-  createAssistantMessageEventStream,
-  type AssistantMessage,
-  type Message,
-} from "openclaw/plugin-sdk/llm";
 import { Type } from "typebox";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { runAgentLoop } from "../../packages/agent-core/src/agent-loop.js";
+import type { StreamFn } from "../../packages/agent-core/src/types.js";
 import { onDiagnosticEvent, resetDiagnosticEventsForTest } from "../infra/diagnostic-events.js";
+import type { AssistantMessage, Message } from "../llm/types.js";
+import { createAssistantMessageEventStream } from "../llm/utils/event-stream.js";
 import {
   getDiagnosticSessionState,
   resetDiagnosticSessionStateForTest,
@@ -47,6 +45,111 @@ function rejectedCall(id: string, name: string, args: Record<string, unknown>) {
       details: {},
     },
   };
+}
+
+const composedTurnCap = 40;
+const execFailure = {
+  content: [{ type: "text" as const, text: "Traceback: missing package" }],
+  details: { status: "completed", exitCode: 1, aggregated: "Traceback: missing package" },
+};
+
+type ToolCallContent = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
+
+/** Drive the real agent loop with real batch admission and wrapped read/exec tools. */
+async function runComposedLoop(runId: string, callsForTurn: (turn: number) => ToolCallContent[]) {
+  const hookCtx = { ...ctx, runId };
+  const readExecute = vi.fn(async () => ({
+    content: [{ type: "text" as const, text: "unchanged" }],
+    details: {},
+  }));
+  const execExecute = vi.fn(async () => execFailure);
+  const tools = [
+    wrapToolWithBeforeToolCallHook(
+      {
+        name: "read",
+        label: "read",
+        description: "read",
+        parameters: Type.Object({ path: Type.String() }),
+        execute: readExecute,
+      },
+      hookCtx,
+    ),
+    wrapToolWithBeforeToolCallHook(
+      {
+        name: "exec",
+        label: "exec",
+        description: "exec",
+        parameters: Type.Object({ command: Type.String() }),
+        execute: execExecute,
+      },
+      hookCtx,
+    ),
+  ];
+  let turns = 0;
+  const streamFn: StreamFn = () => {
+    turns += 1;
+    const calls = turns <= composedTurnCap ? callsForTurn(turns) : [];
+    const message: AssistantMessage = {
+      role: "assistant",
+      content: calls.length > 0 ? calls : [{ type: "text", text: "done" }],
+      api: "faux",
+      provider: "faux",
+      model: "faux-1",
+      usage: createZeroUsageFixture(),
+      stopReason: calls.length > 0 ? "toolUse" : "stop",
+      timestamp: turns,
+    };
+    const stream = createAssistantMessageEventStream();
+    queueMicrotask(() => {
+      stream.push({
+        type: "done",
+        reason: message.stopReason === "toolUse" ? "toolUse" : "stop",
+        message,
+      });
+      stream.end();
+    });
+    return stream;
+  };
+
+  const messages = await runAgentLoop(
+    [{ role: "user", content: "keep going", timestamp: 0 }],
+    { systemPrompt: "", messages: [], tools },
+    {
+      model: {
+        id: "faux-1",
+        name: "Faux",
+        api: "faux",
+        provider: "faux",
+        baseUrl: "https://example.test",
+        reasoning: false,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 1_000,
+        maxTokens: 1_000,
+      },
+      convertToLlm: (entries) => entries as Message[],
+      beforeToolBatch: createToolLoopBatchAdmission(hookCtx),
+    },
+    () => {},
+    undefined,
+    streamFn,
+  );
+  return { messages, turns, execExecute };
+}
+
+function firstLoopBlock(messages: readonly { role: string; details?: unknown }[]) {
+  return messages.find(
+    (message) =>
+      message.role === "toolResult" &&
+      (message.details as { deniedReason?: string } | undefined)?.deniedReason === "tool-loop",
+  );
+}
+
+function expectRecoveryStop(messages: readonly unknown[]) {
+  expect(messages.at(-1)).toMatchObject({
+    role: "assistant",
+    content: [{ type: "text", text: expect.stringContaining("tool-loop recovery") }],
+  });
 }
 
 describe("whole-batch tool-loop admission", () => {
@@ -176,102 +279,53 @@ describe("whole-batch tool-loop admission", () => {
   });
 
   it("blocks a repeated batch that mixes a valid call with a rejected one", async () => {
-    const hookCtx = { ...ctx, runId: "run-mixed" };
-    const readExecute = vi.fn(async () => ({
-      content: [{ type: "text" as const, text: "unchanged" }],
-      details: {},
-    }));
-    const execExecute = vi.fn(async () => ({ content: [], details: {} }));
-    const tools = [
-      wrapToolWithBeforeToolCallHook(
-        {
-          name: "read",
-          label: "read",
-          description: "read",
-          parameters: Type.Object({ path: Type.String() }),
-          execute: readExecute,
-        },
-        hookCtx,
-      ),
-      wrapToolWithBeforeToolCallHook(
-        {
-          name: "exec",
-          label: "exec",
-          description: "exec",
-          parameters: Type.Object({ command: Type.String() }),
-          execute: execExecute,
-        },
-        hookCtx,
-      ),
-    ];
-    const turnCap = 40;
-    let turn = 0;
-    const streamFn: StreamFn = () => {
-      turn += 1;
-      const message: AssistantMessage = {
-        role: "assistant",
-        content:
-          turn <= turnCap
-            ? [
-                { type: "toolCall", id: `read-${turn}`, name: "read", arguments: { path: "a" } },
-                { type: "toolCall", id: `exec-${turn}`, name: "exec", arguments: {} },
-              ]
-            : [{ type: "text", text: "gave up" }],
-        api: "faux",
-        provider: "faux",
-        model: "faux-1",
-        usage: createZeroUsageFixture(),
-        stopReason: turn <= turnCap ? "toolUse" : "stop",
-        timestamp: turn,
-      };
-      const stream = createAssistantMessageEventStream();
-      queueMicrotask(() => {
-        stream.push({
-          type: "done",
-          reason: message.stopReason === "toolUse" ? "toolUse" : "stop",
-          message,
-        });
-        stream.end();
-      });
-      return stream;
-    };
+    const { messages, turns, execExecute } = await runComposedLoop("run-mixed", (turn) => [
+      { type: "toolCall", id: `read-${turn}`, name: "read", arguments: { path: "a" } },
+      { type: "toolCall", id: `exec-${turn}`, name: "exec", arguments: {} },
+    ]);
 
-    const messages = await runAgentLoop(
-      [{ role: "user", content: "keep going", timestamp: 0 }],
-      { systemPrompt: "", messages: [], tools },
-      {
-        model: {
-          id: "faux-1",
-          name: "Faux",
-          api: "faux",
-          provider: "faux",
-          baseUrl: "https://example.test",
-          reasoning: false,
-          input: ["text"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: 1_000,
-          maxTokens: 1_000,
-        },
-        convertToLlm: (entries) => entries as Message[],
-        beforeToolBatch: createToolLoopBatchAdmission(hookCtx),
-      },
-      () => {},
-      undefined,
-      streamFn,
-    );
-
-    const firstBlocked = messages.find(
-      (message) =>
-        message.role === "toolResult" &&
-        (message.details as { deniedReason?: string } | undefined)?.deniedReason === "tool-loop",
-    );
     // In assistant order the pair alternates, so ping-pong detection blocks it.
-    expect(firstBlocked).toMatchObject({ toolCallId: "read-11" });
+    expect(firstLoopBlock(messages)).toMatchObject({ toolCallId: "read-11" });
     expect(execExecute).not.toHaveBeenCalled();
-    expect(turn).toBeLessThan(turnCap);
+    expect(turns).toBeLessThan(composedTurnCap);
+    expectRecoveryStop(messages);
+  });
+
+  it("blocks changing exec failures across rejected calls to another tool", async () => {
+    const { messages, turns, execExecute } = await runComposedLoop("run-exec-tail", (turn) => [
+      {
+        type: "toolCall",
+        id: `exec-${turn}`,
+        name: "exec",
+        arguments: { command: `python job-${turn}.py` },
+      },
+      ...(turn % 4 === 0
+        ? [{ type: "toolCall" as const, id: `read-${turn}`, name: "read", arguments: {} }]
+        : []),
+    ]);
+
+    // Rejected reads never ran, so they must not end the exec failure tail.
+    expect(firstLoopBlock(messages)).toMatchObject({ toolCallId: "exec-21" });
+    expect(execExecute).toHaveBeenCalledTimes(20);
+    expect(turns).toBeLessThan(composedTurnCap);
+    expectRecoveryStop(messages);
+  });
+
+  it("runs a corrected call after repeated argument-validation failures", async () => {
+    const { messages, execExecute } = await runComposedLoop("run-corrected", (turn) =>
+      turn <= 12
+        ? [{ type: "toolCall", id: `exec-${turn}`, name: "exec", arguments: {} }]
+        : turn === 13
+          ? [{ type: "toolCall", id: "exec-fixed", name: "exec", arguments: { command: "ls" } }]
+          : [],
+    );
+
+    expect(firstLoopBlock(messages)).toBeUndefined();
+    expect(execExecute).toHaveBeenCalledTimes(1);
+    expect(execExecute.mock.calls[0]?.[1]).toEqual({ command: "ls" });
     expect(messages.at(-1)).toMatchObject({
       role: "assistant",
-      content: [{ type: "text", text: expect.stringContaining("tool-loop recovery") }],
+      content: [{ type: "text", text: "done" }],
     });
   });
 
