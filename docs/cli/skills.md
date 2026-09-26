@@ -121,9 +121,12 @@ the same target boundary. They never read or mutate client-local state after an
 explicitly selected Gateway fails; intentional offline behavior remains
 available only for an implicitly selected local Gateway.
 
-Git and local directory installs expect `SKILL.md` at the source root. The
-install slug comes from `SKILL.md` frontmatter `name` when it is valid, then
-the source directory or repository name; use `--as <slug>` to override it.
+Git and local directory installs expect `SKILL.md` at the source root. Before
+copying anything, they refuse a `SKILL.md` that skill discovery would skip, such
+as one without an opening `---` frontmatter line, without a `description`, or
+larger than `skills.limits.maxSkillFileBytes`. The install slug comes from
+`SKILL.md` frontmatter `name` when it is valid, then the source directory or
+repository name; use `--as <slug>` to override it.
 `--version` is ClawHub-only. Skill installs do not support npm package specs
 or zip/archive paths, and `openclaw skills update` updates ClawHub-tracked
 installs only.

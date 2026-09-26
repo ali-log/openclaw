@@ -569,6 +569,86 @@ describe("installSkillFromSource", () => {
     });
   });
 
+  it.each([
+    {
+      name: "frontmatter without an opening --- line",
+      content: "name: probe-x\ndescription: probe\n---\n\n# Probe\n",
+      reason: "description is required",
+    },
+    {
+      name: "frontmatter without a description",
+      content: "---\nname: probe-x\n---\n\n# Probe\n",
+      reason: "description is required",
+    },
+    {
+      name: "a SKILL.md over the discovery size limit",
+      content: `---\nname: probe-x\ndescription: probe\n---\n\n${"x".repeat(2048)}\n`,
+      reason: "File exceeds 1024 bytes",
+    },
+  ])("refuses a local skill that discovery would skip: $name", async ({ content, reason }) => {
+    await withTestDir({ prefix: "openclaw-skill-source-unloadable-" }, async (root) => {
+      const workspaceDir = path.join(root, "workspace");
+      const sourceDir = path.join(root, "probe");
+      await fs.mkdir(sourceDir, { recursive: true });
+      await fs.writeFile(path.join(sourceDir, "SKILL.md"), content);
+
+      const result = await installSkillFromSource({
+        workspaceDir,
+        spec: sourceDir,
+        slug: "probe-x",
+        config: { skills: { limits: { maxSkillFileBytes: 1024 } } },
+      });
+
+      expect(result).toMatchObject({ ok: false, error: expect.stringContaining(reason) });
+      await expect(fs.access(path.join(workspaceDir, "skills", "probe-x"))).rejects.toThrow();
+    });
+  });
+
+  it("installs a valid local skill whose SKILL.md is hardlinked", async () => {
+    await withTestDir({ prefix: "openclaw-skill-source-hardlinked-" }, async (root) => {
+      const workspaceDir = path.join(root, "workspace");
+      const sourceDir = path.join(root, "source");
+      await writeSkill(sourceDir, { name: "linked-skill" });
+      await fs.link(path.join(sourceDir, "SKILL.md"), path.join(root, "SKILL-link.md"));
+
+      expect(await installSkillFromSource({ workspaceDir, spec: sourceDir })).toMatchObject({
+        ok: true,
+        slug: "linked-skill",
+      });
+    });
+  });
+
+  it("refuses a git skill that discovery would skip", async () => {
+    await withTestDir({ prefix: "openclaw-skill-source-git-unloadable-" }, async (root) => {
+      const workspaceDir = path.join(root, "workspace");
+      const repoDir = path.join(root, "repo");
+      await fs.mkdir(repoDir, { recursive: true });
+      await fs.writeFile(path.join(repoDir, "SKILL.md"), "---\nname: git-skill\n---\n\n# Skill\n");
+      await runGitOk(repoDir, ["init"]);
+      await runGitOk(repoDir, ["add", "SKILL.md"]);
+      await runGitOk(repoDir, [
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "user.name=Test User",
+        "commit",
+        "-m",
+        "add skill",
+      ]);
+
+      const result = await installSkillFromSource({
+        workspaceDir,
+        spec: `git:file://${repoDir}`,
+      });
+
+      expect(result).toMatchObject({
+        ok: false,
+        error: expect.stringContaining("description is required"),
+      });
+      await expect(fs.access(path.join(workspaceDir, "skills", "git-skill"))).rejects.toThrow();
+    });
+  });
+
   it("rejects missing local skill roots before treating them as ClawHub slugs", async () => {
     await withTestDir({ prefix: "openclaw-skill-source-missing-" }, async (root) => {
       const result = await installSkillFromSource({

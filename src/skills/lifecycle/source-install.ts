@@ -12,6 +12,8 @@ import { isImmutableGitCommitRef, parseGitPluginSpec } from "../../plugins/git-i
 import type { InstallSafetyOverrides } from "../../plugins/install-security-scan.types.js";
 import { resolveUserPath } from "../../utils.js";
 import { parseSkillFrontmatter } from "../loading/frontmatter.js";
+import { loadSingleSkillDirectory } from "../loading/local-loader.js";
+import { resolveSkillDiscoveryLimits } from "../loading/skill-root-discovery.js";
 import { installExtractedSkillRoot } from "./archive-install.js";
 import { validateRequestedSkillSlug } from "./install-paths.js";
 import { recordSkillSourceInstall, type SkillSourceOrigin } from "./source-install-metadata.js";
@@ -51,6 +53,33 @@ function createGitCommandEnv(): NodeJS.ProcessEnv {
     },
     blockPathOverrides: false,
   });
+}
+
+// Installed skills are discovered from files, so refuse a SKILL.md that discovery would skip
+// instead of copying a skill that never loads.
+async function describeUnloadableSkill(params: {
+  sourceDir: string;
+  sourceSpec: string;
+  config?: OpenClawConfig;
+}): Promise<string | undefined> {
+  const { maxSkillFileBytes } = resolveSkillDiscoveryLimits(params.config);
+  let problem: string | undefined;
+  loadSingleSkillDirectory({
+    skillDir: params.sourceDir,
+    source: "openclaw-workspace",
+    rootRealPath: await fs.realpath(params.sourceDir),
+    maxBytes: maxSkillFileBytes,
+    // The install copy gets fresh inodes, so a hardlinked source still loads once installed.
+    rejectHardlinks: false,
+    onDiagnostic: (diagnostic) => {
+      problem ??= diagnostic.message;
+    },
+  });
+  return problem
+    ? `Skill ${params.sourceSpec} cannot be loaded: ${problem}. Start SKILL.md with a --- ` +
+        "frontmatter block that sets name and description, and keep it within " +
+        `${maxSkillFileBytes} bytes (skills.limits.maxSkillFileBytes).`
+    : undefined;
 }
 
 async function readSkillNameFromFrontmatter(skillDir: string): Promise<string | null> {
@@ -114,6 +143,10 @@ async function installLocalSkillDir(params: {
   onInstallPolicyWarning?: InstallSafetyOverrides["onInstallPolicyWarning"];
   git?: SkillSourceOrigin["git"];
 }): Promise<SkillSourceInstallResult> {
+  const unloadable = await describeUnloadableSkill(params);
+  if (unloadable) {
+    return { ok: false, error: unloadable };
+  }
   const slug = await resolveSkillInstallSlug({
     sourceDir: params.sourceDir,
     fallbackLabel: params.fallbackLabel,
